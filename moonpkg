@@ -1,0 +1,244 @@
+#    moonpkg - Umbra Linux Simple package manager
+#    Copyright (C) 2026 grzesiowski1223
+#
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+#!/usr/bin/env bash
+
+set -e
+
+# --- SYSTEM CONFIGURATION ---
+TARGET_ROOT="/"
+SOURCES_FILE="/etc/sources"
+
+# Check if the sources configuration file exists
+if [ ! -f "$SOURCES_FILE" ]; then
+  echo -e "\e[31m[ERROR]\e[0m Configuration file '$SOURCES_FILE' is missing." >&2
+  echo "Please create it and add your repository URL." >&2
+  exit 1
+fi
+
+# Dynamically read the active repository URL from /etc/sources
+# It filters out empty lines and lines starting with '#'
+BASE_URL=$(grep -v '^#' "$SOURCES_FILE" | grep -v '^$' | head -n 1)
+
+if [ -z "$BASE_URL" ]; then
+  echo -e "\e[31m[ERROR]\e[0m No active repository URL found in $SOURCES_FILE" >&2
+  exit 1
+fi
+
+# Database and cache paths
+REGISTRY_DIR="${TARGET_ROOT}var/lib/umbra/installed"
+CACHE_DIR="${TARGET_ROOT}var/lib/umbra/cache"
+SECTIONS_LIST="$CACHE_DIR/sections.list"
+
+# --- HELPER FUNCTIONS ---
+usage() {
+  echo -e "\e[33mmoonpkg - Package Manager for Umbra Linux\e[0m"
+  echo "Usage: $0 <command> [options]"
+  echo "Commands:"
+  echo "  update            Fetch the latest package lists from the repository"
+  echo "  upgrade           Upgrade all installed packages to the latest versions"
+  echo "  install <package> Install a package (automatically resolves section)"
+  echo "  remove <package>  Remove a package from the system"
+  exit 1
+}
+
+log() {
+  echo -e "\e[32m[moonpkg]\e[0m $1"
+}
+
+error() {
+  echo -e "\e[31m[ERROR]\e[0m $1" >&2
+  exit 1
+}
+
+if ! command -v curl &>/dev/null; then
+  error "'curl' is required for moonpkg to function."
+fi
+
+parse_json_value() {
+  local key="$1"
+  sed -n "s/.*\"$key\": *\"\(.*\)\".*/\1/p" | head -n 1
+}
+
+find_package_section() {
+  local pkg="$1"
+  if [ ! -f "$SECTIONS_LIST" ]; then
+    return 1
+  fi
+  while read -r sec; do
+    [ -z "$sec" ] && continue
+    if [ -f "$CACHE_DIR/${sec}.json" ]; then
+      if grep -q "\"$pkg\":" "$CACHE_DIR/${sec}.json"; then
+        echo "$sec"
+        return 0
+      fi
+    fi
+  done <"$SECTIONS_LIST"
+  return 1
+}
+
+# --- MAIN LOGICAL FLOW ---
+COMMAND=$1
+case "$COMMAND" in
+update)
+  log "Using repository: $BASE_URL"
+  log "Updating global repository database..."
+  mkdir -p "$CACHE_DIR"
+
+  MAIN_INDEX="$CACHE_DIR/main_index.json"
+
+  # 1. Fetch the master index.json file
+  if ! curl -sfL "$BASE_URL/index.json" -o "$MAIN_INDEX"; then
+    error "Failed to fetch the master index file from repository."
+  fi
+
+  # 2. Dynamically extract subdirectory index paths
+  REPOS=$(sed -n 's/.*".*": *"\([^"]*\)".*/\1/p' "$MAIN_INDEX")
+
+  # 3. Clear old cached section lists
+  rm -f "$SECTIONS_LIST"
+
+  # 4. Fetch each sub-index from the repository list
+  echo "$REPOS" | while read -r repo_path; do
+    [ -z "$repo_path" ] && continue
+
+    sec_name="${repo_path%%/*}"
+    log "Fetching index for section: $sec_name..."
+
+    if curl -sfL "$BASE_URL/$repo_path" -o "$CACHE_DIR/${sec_name}.json"; then
+      echo "$sec_name" >>"$SECTIONS_LIST"
+    else
+      log "Warning: Failed to fetch index for $sec_name."
+    fi
+  done
+  log "Package database updated successfully."
+  ;;
+
+install)
+  PACKAGE=$2
+  if [ -z "$PACKAGE" ]; then usage; fi
+
+  SECTION=$(find_package_section "$PACKAGE" || true)
+
+  if [ -z "$SECTION" ]; then
+    error "Package '$PACKAGE' not found. Please run '$0 update' first."
+  fi
+
+  INDEX_FILE="$CACHE_DIR/${SECTION}.json"
+  VERSION=$(sed -n "/\"$PACKAGE\":/,/}/p" "$INDEX_FILE" | parse_json_value "latest")
+
+  log "Found package '$PACKAGE' in section '$SECTION' (Version: $VERSION)"
+
+  TMP_DIR="/tmp/moonpkg-$$"
+  mkdir -p "$TMP_DIR"
+  trap 'rm -rf "$TMP_DIR"' EXIT
+
+  TARBALL_URL="$BASE_URL/$SECTION/$PACKAGE/${PACKAGE}-${VERSION}.tar.gz"
+  TARBALL_LOCAL="$TMP_DIR/${PACKAGE}-${VERSION}.tar.gz"
+
+  log "Downloading archive..."
+  if ! curl -sfL "$TARBALL_URL" -o "$TARBALL_LOCAL"; then
+    error "Failed to download package from remote repository."
+  fi
+
+  log "Installing to target destination: $TARGET_ROOT"
+  mkdir -p "$TARGET_ROOT" "$REGISTRY_DIR"
+
+  tar -xf "$TARBALL_LOCAL" -C "$TMP_DIR"
+  EXTRACTED_FOLDER="$TMP_DIR/${PACKAGE}-${VERSION}"
+
+  if [ -d "$EXTRACTED_FOLDER/files" ]; then
+    cd "$EXTRACTED_FOLDER/files"
+    find . -not -name "." >"$REGISTRY_DIR/${PACKAGE}.list"
+    cd - >/dev/null
+
+    log "Deploying package files to the system..."
+    cp -a "$EXTRACTED_FOLDER/files/." "$TARGET_ROOT"
+  fi
+
+  if [ -f "$EXTRACTED_FOLDER/manifest.json" ]; then
+    cp "$EXTRACTED_FOLDER/manifest.json" "$REGISTRY_DIR/${PACKAGE}.json"
+  fi
+
+  hash -r 2>/dev/null || true
+  log "Success! Package $PACKAGE ($VERSION) installed successfully by moonpkg."
+  ;;
+
+upgrade)
+  log "Checking for available system updates..."
+
+  if [ ! -d "$REGISTRY_DIR" ] || [ -z "$(ls -A "$REGISTRY_DIR"/*.json 2>/dev/null)" ]; then
+    log "No packages currently installed to upgrade."
+    exit 0
+  fi
+
+  for json_installed in "$REGISTRY_DIR"/*.json; do
+    [ -e "$json_installed" ] || continue
+
+    PKG_NAME=$(basename "$json_installed" .json)
+    LOCAL_VER=$(parse_json_value "version" "$json_installed")
+
+    SECTION=$(find_package_section "$PKG_NAME" || true)
+    if [ -z "$SECTION" ]; then
+      log "Package $PKG_NAME no longer exists in remote repository. Skipping."
+      continue
+    fi
+
+    REMOTE_VER=$(sed -n "/\"$PKG_NAME\":/,/}/p" "$CACHE_DIR/${SECTION}.json" | parse_json_value "latest")
+
+    if [ "$LOCAL_VER" != "$REMOTE_VER" ]; then
+      log "Update available for $PKG_NAME ($LOCAL_VER -> $REMOTE_VER)"
+      "$0" install "$PKG_NAME"
+    else
+      log "Package $PKG_NAME is up to date ($LOCAL_VER)."
+    fi
+  done
+  log "All system packages are up to date!"
+  ;;
+
+remove)
+  PACKAGE=$2
+  if [ -z "$PACKAGE" ]; then usage; fi
+
+  LIST_FILE="$REGISTRY_DIR/${PACKAGE}.list"
+  JSON_FILE="$REGISTRY_DIR/${PACKAGE}.json"
+
+  if [ ! -f "$LIST_FILE" ]; then
+    error "Package '$PACKAGE' is not installed on this system."
+  fi
+
+  log "Uninstalling package '$PACKAGE'..."
+  REVERSED_LIST=$(sed '1!G;h;$!d' "$LIST_FILE")
+
+  echo "$REVERSED_LIST" | while read -r item; do
+    [ -z "$item" ] && continue
+    FULL_PATH="${TARGET_ROOT}${item#./}"
+    if [ -f "$FULL_PATH" ] || [ -L "$FULL_PATH" ]; then
+      rm -f "$FULL_PATH"
+    elif [ -d "$FULL_PATH" ]; then
+      rmdir "$FULL_PATH" 2>/dev/null || true
+    fi
+  done
+
+  rm -f "$LIST_FILE" "$JSON_FILE"
+  hash -r 2>/dev/null || true
+  log "Package '$PACKAGE' has been successfully removed by moonpkg."
+  ;;
+
+*)
+  usage
+  ;;
+esac
