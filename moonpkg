@@ -1,4 +1,5 @@
-#    moonpkg - Umbra Linux Simple package manager
+#!/bin/env bash
+#    moonpkg alpha 1.6.2 (debug) - Package manager for Umbra Linux written in bash
 #    Copyright (C) 2026 grzesiowski1223
 #
 #    This program is free software: you can redistribute it and/or modify
@@ -10,235 +11,331 @@
 #    but WITHOUT ANY WARRANTY; without even the implied warranty of
 #    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 #    GNU General Public License for more details.
-#
+
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-#!/usr/bin/env bash
-
-set -e
-
-# --- SYSTEM CONFIGURATION ---
-TARGET_ROOT="/"
-SOURCES_FILE="/etc/sources"
-
-# Check if the sources configuration file exists
-if [ ! -f "$SOURCES_FILE" ]; then
-  echo -e "\e[31m[ERROR]\e[0m Configuration file '$SOURCES_FILE' is missing." >&2
-  echo "Please create it and add your repository URL." >&2
-  exit 1
-fi
-
-# Dynamically read the active repository URL from /etc/sources
-# It filters out empty lines and lines starting with '#'
-BASE_URL=$(grep -v '^#' "$SOURCES_FILE" | grep -v '^$' | head -n 1)
-
-if [ -z "$BASE_URL" ]; then
-  echo -e "\e[31m[ERROR]\e[0m No active repository URL found in $SOURCES_FILE" >&2
-  exit 1
-fi
-
-# Database and cache paths
-REGISTRY_DIR="${TARGET_ROOT}var/lib/umbra/installed"
-CACHE_DIR="${TARGET_ROOT}var/lib/umbra/cache"
-SECTIONS_LIST="$CACHE_DIR/sections.list"
-
-# --- HELPER FUNCTIONS ---
-usage() {
-  echo -e "\e[33mmoonpkg - Package Manager for Umbra Linux\e[0m"
-  echo "Usage: $0 <command> [options]"
-  echo "Commands:"
-  echo "  update            Fetch the latest package lists from the repository"
-  echo "  upgrade           Upgrade all installed packages to the latest versions"
-  echo "  install <package> Install a package (automatically resolves section)"
-  echo "  remove <package>  Remove a package from the system"
-  exit 1
-}
+VERSION="alpha 1.6.2 (debug)"
+TEMPDIR=/tmp/.temp_moonpkg
+DB_DIR="/var/lib/moonpkg"
+REPOSITORY="https://raw.githubusercontent.com/Umbra-Linux/UmbraLinux-Packages/refs/heads/main/Experimental"
 
 log() {
-  echo -e "\e[32m[moonpkg]\e[0m $1"
+  c1=$'\e[32m'   # Zielony (dla zwykłych wiadomości i strzałek)
+  c2=$'\e[33m'   # Żółty (dla ostrzeżeń i nazw pakietów)
+  c3=$'\e[0m'    # Reset kolorów
+  c4=$'\e[31m'   # Czerwony (dla błędów)
+
+  # Dobieramy kolor tekstu w zależności od statusu (ERROR -> czerwony, WARNING -> żółty, domyślnie brak)
+  local type_color=""
+  if [ "$3" = "ERROR" ]; then
+    type_color="$c4"
+  elif [ "$3" = "WARNING" ]; then
+    type_color="$c2"
+  fi
+
+  # Wyświetlanie sformatowanego tekstu na ekranie i zapis do logu
+  printf "%b%s %b%s%b %b%s%b\n" "$c1" "${3:-->}" "$c3" "${2:+$c2}" "$1" "$type_color" "$2" "$c3" | tee -a /var/log/moonpkg >&2
+}
+
+war() {
+    log "$1" "$2" "WARNING"
+}
+
+msg() {
+  log "$1"
 }
 
 error() {
-  echo -e "\e[31m[ERROR]\e[0m $1" >&2
-  exit 1
+    # Przekazuje komunikat o błędzie bezpośrednio do logowania z flagą ERROR
+    log "$1" "${2:-}" "ERROR"
+    exit 1
 }
 
-if ! command -v curl &>/dev/null; then
-  error "'curl' is required for moonpkg to function."
+
+checkifsuccess() {
+ if [ $? == 0 ]; then
+  msg "$1"
+ else
+  error "$2"
+ fi
+}
+
+tmp_dir_create() {
+ mkdir -p "$TEMPDIR"
+ checkifsuccess "[DEBUG]: creating temp dir successful" "Failed to create temp directory"
+}
+
+download_package() {
+ local package="$1"
+ local version="$2"
+
+ # Konstruujemy poprawny, dynamiczny URL
+ local package_url="$REPOSITORY/$package/$package-$version.tar.gz"
+ local checksum_url="$REPOSITORY/$package/$package-$version.tar.gz.sha256"
+
+ # Pobieranie archiwum pakietu do katalogu tymczasowego
+ msg "Downloading package '$package' ($version) from UmbraRepository..."
+ wget -P "$TEMPDIR" "$package_url"
+ checkifsuccess "Downloaded $package-$version.tar.gz successfully." "Failed to download $package-$version.tar.gz from repository."
+
+ # Pobieranie pliku sumy kontrolnej SHA256
+# msg "Downloading SHA256 checksum for '$package'..."
+# wget -P "$TEMPDIR" "$checksum_url"
+# checkifsuccess "Downloaded SHA256 checksum." "Failed to download SHA256 checksum for $package."
+}
+
+decompress() {
+ local package="$1"
+ local version="$2"
+ msg "Decompressing $package"
+
+ tar -xvf "$TEMPDIR/$package-$version.tar.gz" -C "$TEMPDIR"
+ if [ $? -eq 2 ]; then
+   error "Failed to decompress $pkg_name."
+ else
+   log "Decompressed $pkg_name successfully"
+ fi
+}
+
+sha256() {
+ local package="$1"
+ local version="$2"
+ msg "Checking checksum of the package $package..."
+
+ cd "$TEMPDIR" || error "Failed to access temporary directory"
+ sha256sum -c "$package-$version.tar.gz.sha256"
+ checkifsuccess "SHA256 Passed" "SHA256 FAILED"
+ cd - > /dev/null || exit
+}
+
+pkg_install() {
+ local package="$1"
+
+ if [ -z "$package" ]; then
+    error "Please specify a package name to install."
+ fi
+
+ # 1. Sprawdzanie czy baza danych index.json istnieje
+ if [ ! -f "$DB_DIR/index.json" ]; then
+    war "Local repository index missing. Auto-updating..."
+    pkg_update
+ fi
+
+ if checkIfInstalled "$package"; then
+    error "$package is installed on the system."
+ else
+    msg "$package is not installed on the system. Installing"
+ fi
+
+ # 2. Odczytywanie najnowszej wersji z pliku index.json przy użyciu jq
+ msg "Checking available version for '$package'..."
+ local version
+ version=$(jq -r ".\"$package\".latest" "$DB_DIR/index.json" 2>/dev/null)
+
+ if [ "$version" == "null" ] || [ -z "$version" ]; then
+    error "Package '$package' not found in repository index."
+ fi
+
+ msg "Found '$package' version: $version"
+
+ # 3. Proces pobierania i weryfikacji
+ tmp_dir_create
+ download_package "$package" "$version"
+# sha256 "$package" "$version"
+ decompress "$package" "$version"
+# dependency_resolve
+ # 4. Kopiowanie składowych do systemu
+ msg "Installing files to system..."
+
+ # Budujemy dynamiczną ścieżkę do rozpakowanych plików, np. /tmp/.temp_moonpkg/neofetch-7.1.0/files
+ local install_source="$TEMPDIR/$package-$version/files"
+
+ # Sprawdzamy czy folder /files istnieje w archiwum
+ if [ -d "$install_source" ]; then
+     # Kopiujemy zawartość bezpośrednio do głównych katalogów systemowych
+     if [ -d "$install_source/bin" ]; then
+         cp -r "$install_source/bin/"* /usr/bin/
+         checkifsuccess "[DEBUG]: Copied to /usr/bin directory..." "Failed to copy binaries."
+     fi
+
+     if [ -d "$install_source/lib" ]; then
+         cp -r "$install_source/lib/"* /lib/
+         checkifsuccess "[DEBUG]: Copied to /lib directory..." "Failed to copy libraries."
+     fi
+
+     # Dodana obsługa dla struktury /usr wewnątrz paczki (jak w Twoim neofetchu)
+     if [ -d "$install_source/usr" ]; then
+         cp -r "$install_source/usr/"* /usr/
+         checkifsuccess "[DEBUG]: Copied to /usr directory..." "Failed to copy /usr contents."
+     fi
+ else
+     error "Invalid package structure: 'files' directory missing in archive."
+ fi
+
+ addtoDB
+ # 5. Czyszczenie po instalacji
+ rm -rf "$TEMPDIR"
+ msg "Package '$package' installed successfully."
+}
+
+addtoDB() {
+ # Zapisanie zainstalowanego pakietu i jego wersji do bazy danych
+ local db_file="$DB_DIR/packagesDwnld.json"
+ # Jeśli baza nie istnieje, utwórz ją najpierw
+ [ ! -f "$db_file" ] && echo "{}" > "$db_file"
+
+ jq --arg pkg "$package" --arg ver "$version" '.[$pkg] = $ver' "$db_file" > "$db_file.tmp" && mv "$db_file.tmp" "$db_file"
+
+}
+
+checkIfInstalled() {
+    local package="$1"
+#    local version="$2"
+    local db_file="$DB_DIR/packagesDwnld.json"
+
+    if [ ! -f "$db_file" ]; then
+        war "Local Packages index missing. Creating..."
+        mkdir -p "$DB_DIR"
+        chmod 755 "$DB_DIR"
+        echo "{}" > "$db_file"
+        chmod 644 "$db_file"
+    fi
+
+    local installed_version
+    installed_version=$(jq -r ".\"$package\"" "$db_file" 2>/dev/null)
+
+    # 3. Zwracanie statusu (0 = zainstalowany, 1 = brak)
+    if [ "$installed_version" != "null" ] && [ -n "$installed_version" ]; then
+        return 0 # Pakiet jest zainstalowany
+    else
+        return 1 # Pakiet NIE jest zainstalowany
+    fi
+}
+
+dependency_resolve() {
+    local package="$1"
+    local version="$2"
+    local manifest="$TEMPDIR/$package-$version/manifest.json"
+
+    if [ ! -f "$manifest" ]; then
+        error "manifest.json does not exist in package archive and because of that moonpkg can't resolve dependencies."
+        return 1
+    fi
+
+    dependencies=$(jq -r '.dependencies // empty | to_entries[] | "\(.key) \(.value)"' "$manifest")
+
+    if [ -z "$dependencies" ]; then
+        msg "No dependencies, continuing..."
+        return 0
+    fi
+
+    echo "$dependencies" | while read -r dep_name dep_ver; do
+        msg "Resolving dependency: $dep_name ($dep_ver)"
+        # Tutaj możesz dodać rekurencyjne wywołanie: dependency_resolve "$dep_name" "$dep_ver"
+    done
+}
+
+pkg_list_installed() {
+    local db_file="$DB_DIR/packagesDwnld.json"
+
+    if [ ! -f "$db_file" ] || [ "$(jq 'length' "$db_file" 2>/dev/null)" -eq 0 ]; then
+        msg "No packages installed yet."
+        return 0
+    fi
+
+    msg "List of installed packages:"
+    jq -r 'to_entries[] | "\(.key) \(.value)"' "$db_file" | while read -r pkg_name pkg_ver; do
+        # Formatowanie: zielona strzałka, żółta nazwa pakietu, domyślny kolor dla wersji
+        printf "%b-> %b%s%b version: %s\n" "${c1:-\e[32m}" "${c2:-\e[33m}" "$pkg_name" "${c3:-\e[0m}" "$pkg_ver"
+    done
+#    echo ""
+#    echo ""
+}
+
+# Messy fix for umbra patched neofetch showing packages
+if [ $1 == list ]; then
+ pkg_list_installed
 fi
 
-parse_json_value() {
-  local key="$1"
-  sed -n "s/.*\"$key\": *\"\(.*\)\".*/\1/p" | head -n 1
+pkg_install_deps() {
+ dependency_resolve
+ echo "test"
 }
 
-find_package_section() {
-  local pkg="$1"
-  if [ ! -f "$SECTIONS_LIST" ]; then
-    return 1
-  fi
-  while read -r sec; do
-    [ -z "$sec" ] && continue
-    if [ -f "$CACHE_DIR/${sec}.json" ]; then
-      if grep -q "\"$pkg\":" "$CACHE_DIR/${sec}.json"; then
-        echo "$sec"
-        return 0
-      fi
-    fi
-  done <"$SECTIONS_LIST"
-  return 1
+pkg_remove() {
+ echo "remove"
 }
 
-# --- MAIN LOGICAL FLOW ---
-COMMAND=$1
-case "$COMMAND" in
-update)
-  log "Using repository: $BASE_URL"
-  log "Updating global repository database..."
-  mkdir -p "$CACHE_DIR"
+pkg_update() {
+ mkdir -p "$DB_DIR"
+ msg "Updating repository package lists from UmbraRepository..."
 
-  MAIN_INDEX="$CACHE_DIR/main_index.json"
+ # Downloading to the tmp
+ wget -O "$DB_DIR/index.json.tmp" "$REPOSITORY/index.json"
+ checkifsuccess "Downloaded repository file." "Failed to fetch repository index.json."
+# WSL FIX
+ tr -d '\r' < "$DB_DIR/index.json.tmp" > "$DB_DIR/index.json" # To bedzie można wywalić wsm bo ten pkgmng nie jest przytosowany do WSL i dlatego ten fix
+ rm -f "$DB_DIR/index.json.tmp"
 
-  # 1. Fetch the master index.json file
-  if ! curl -sfL "$BASE_URL/index.json" -o "$MAIN_INDEX"; then
-    error "Failed to fetch the master index file from repository."
-  fi
+ msg "Repository updated successfully."
+}
 
-  # 2. Dynamically extract subdirectory index paths
-  REPOS=$(sed -n 's/.*".*": *"\([^"]*\)".*/\1/p' "$MAIN_INDEX")
 
-  # 3. Clear old cached section lists
-  rm -f "$SECTIONS_LIST"
+pkg_upgrade() {
+ echo "upgrade"
+}
 
-  # 4. Fetch each sub-index from the repository list
-  echo "$REPOS" | while read -r repo_path; do
-    [ -z "$repo_path" ] && continue
+pkg_verify() {
+ echo "verify" # Po co verify? w jakim sensie? co ja miałem wtedy na myśli, może integrity veryfy?
+}
 
-    sec_name="${repo_path%%/*}"
-    log "Fetching index for section: $sec_name..."
+pkg_postinstall() {
+ echo "postscript"
+}
 
-    if curl -sfL "$BASE_URL/$repo_path" -o "$CACHE_DIR/${sec_name}.json"; then
-      echo "$sec_name" >>"$SECTIONS_LIST"
-    else
-      log "Warning: Failed to fetch index for $sec_name."
-    fi
-  done
-  log "Package database updated successfully."
-  ;;
-
-install)
-  PACKAGE=$2
-  if [ -z "$PACKAGE" ]; then usage; fi
-
-  SECTION=$(find_package_section "$PACKAGE" || true)
-
-  if [ -z "$SECTION" ]; then
-    error "Package '$PACKAGE' not found. Please run '$0 update' first."
-  fi
-
-  INDEX_FILE="$CACHE_DIR/${SECTION}.json"
-  VERSION=$(sed -n "/\"$PACKAGE\":/,/}/p" "$INDEX_FILE" | parse_json_value "latest")
-
-  log "Found package '$PACKAGE' in section '$SECTION' (Version: $VERSION)"
-
-  TMP_DIR="/tmp/moonpkg-$$"
-  mkdir -p "$TMP_DIR"
-  trap 'rm -rf "$TMP_DIR"' EXIT
-
-  TARBALL_URL="$BASE_URL/$SECTION/$PACKAGE/${PACKAGE}-${VERSION}.tar.gz"
-  TARBALL_LOCAL="$TMP_DIR/${PACKAGE}-${VERSION}.tar.gz"
-
-  log "Downloading archive..."
-  if ! curl -sfL "$TARBALL_URL" -o "$TARBALL_LOCAL"; then
-    error "Failed to download package from remote repository."
-  fi
-
-  log "Installing to target destination: $TARGET_ROOT"
-  mkdir -p "$TARGET_ROOT" "$REGISTRY_DIR"
-
-  tar -xf "$TARBALL_LOCAL" -C "$TMP_DIR"
-  EXTRACTED_FOLDER="$TMP_DIR/${PACKAGE}-${VERSION}"
-
-  if [ -d "$EXTRACTED_FOLDER/files" ]; then
-    cd "$EXTRACTED_FOLDER/files"
-    find . -not -name "." >"$REGISTRY_DIR/${PACKAGE}.list"
-    cd - >/dev/null
-
-    log "Deploying package files to the system..."
-    cp -a "$EXTRACTED_FOLDER/files/." "$TARGET_ROOT"
-  fi
-
-  if [ -f "$EXTRACTED_FOLDER/manifest.json" ]; then
-    cp "$EXTRACTED_FOLDER/manifest.json" "$REGISTRY_DIR/${PACKAGE}.json"
-  fi
-
-  hash -r 2>/dev/null || true
-  log "Success! Package $PACKAGE ($VERSION) installed successfully by moonpkg."
-  ;;
-
-upgrade)
-  log "Checking for available system updates..."
-
-  if [ ! -d "$REGISTRY_DIR" ] || [ -z "$(ls -A "$REGISTRY_DIR"/*.json 2>/dev/null)" ]; then
-    log "No packages currently installed to upgrade."
-    exit 0
-  fi
-
-  for json_installed in "$REGISTRY_DIR"/*.json; do
-    [ -e "$json_installed" ] || continue
-
-    PKG_NAME=$(basename "$json_installed" .json)
-    LOCAL_VER=$(parse_json_value "version" "$json_installed")
-
-    SECTION=$(find_package_section "$PKG_NAME" || true)
-    if [ -z "$SECTION" ]; then
-      log "Package $PKG_NAME no longer exists in remote repository. Skipping."
-      continue
+main() {
+    if [[ $EUID -ne 0 ]]; then
+        error "This program must be run as root"
+        exit 1
     fi
 
-    REMOTE_VER=$(sed -n "/\"$PKG_NAME\":/,/}/p" "$CACHE_DIR/${SECTION}.json" | parse_json_value "latest")
+    local bin_missing=0
+    for cmd in jq wget tar sha256sum tr; do
+        if ! command -v "$cmd" &> /dev/null; then
+            war "Required system tool '$cmd' is missing."
+            bin_missing=1
+        fi
+    done
 
-    if [ "$LOCAL_VER" != "$REMOTE_VER" ]; then
-      log "Update available for $PKG_NAME ($LOCAL_VER -> $REMOTE_VER)"
-      "$0" install "$PKG_NAME"
-    else
-      log "Package $PKG_NAME is up to date ($LOCAL_VER)."
+    if [ "$bin_missing" -eq 1 ]; then
+        error "Please install the missing dependencies before running moonpkg."
     fi
-  done
-  log "All system packages are up to date!"
-  ;;
 
-remove)
-  PACKAGE=$2
-  if [ -z "$PACKAGE" ]; then usage; fi
-
-  LIST_FILE="$REGISTRY_DIR/${PACKAGE}.list"
-  JSON_FILE="$REGISTRY_DIR/${PACKAGE}.json"
-
-  if [ ! -f "$LIST_FILE" ]; then
-    error "Package '$PACKAGE' is not installed on this system."
-  fi
-
-  log "Uninstalling package '$PACKAGE'..."
-  REVERSED_LIST=$(sed '1!G;h;$!d' "$LIST_FILE")
-
-  echo "$REVERSED_LIST" | while read -r item; do
-    [ -z "$item" ] && continue
-    FULL_PATH="${TARGET_ROOT}${item#./}"
-    if [ -f "$FULL_PATH" ] || [ -L "$FULL_PATH" ]; then
-      rm -f "$FULL_PATH"
-    elif [ -d "$FULL_PATH" ]; then
-      rmdir "$FULL_PATH" 2>/dev/null || true
+    # Sprawdza, czy pierwszy argument ($1) jest pusty (-z)
+    if [ -z "$1" ]; then
+        echo "moonpkg $VERSION usage:"
+        echo "  install: Is used to install the package"
+        echo "  remove:  Is used to uninstall the package"
+        echo "  update:  Is used to update repo sources"
+        echo "  upgrade: Is used to upgrade specific package or all packages in the system"
+        echo "  list: Is used to list installed files"
+        echo "  version: Is used to display moonpkg version"
+        exit 1
     fi
-  done
 
-  rm -f "$LIST_FILE" "$JSON_FILE"
-  hash -r 2>/dev/null || true
-  log "Package '$PACKAGE' has been successfully removed by moonpkg."
-  ;;
+    case "$1" in
+        install) pkg_install "$2" ;;
+        remove)  pkg_remove "$2" ;;
+        update)  pkg_update ;;
+        upgrade) pkg_upgrade "$2";;
+        version) echo "$VERSION" ;;
+        -i) pkg_install "$2" ;;
+        -v) echo "$VERSION" ;;
+        debug) "$2" ;;
+        *) msg "Unknown command" "$1" ;;
+    esac
+}
 
-*)
-  usage
-  ;;
-esac
+# Wywołanie funkcji głównej z przekazaniem wszystkich argumentów skryptu
+main "$@"
